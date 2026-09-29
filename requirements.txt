@@ -1,0 +1,6 @@
+huggingface_hub
+pydantic
+python-dotenv
+pandas
+opencv-python
+streamlit
