@@ -50,7 +50,9 @@ def process_prescription(
 
     (
         verified_medicines,
-        unverified_medicines
+        candidate_medicines,
+        uncertain_medicines,
+        unverified_medicines,
     ) = verifier.get_verified_medicines(
         prescription
     )
@@ -65,6 +67,12 @@ def process_prescription(
 
         "verified_medicines":
             verified_medicines,
+
+        "candidate_medicines":
+            candidate_medicines,
+
+        "uncertain_medicines":
+            uncertain_medicines,
 
         "unverified_medicines":
             unverified_medicines

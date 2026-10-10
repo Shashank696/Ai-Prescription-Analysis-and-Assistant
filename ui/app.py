@@ -11,6 +11,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.extraction.prescription_extractor import ExtractionProviderError
+from src.recommendation.medicine_recommender import (
+    TIER_POSSIBLE_EQUIVALENT,
+    TIER_SAME_PRODUCT,
+    TIER_WEAKER_MATCH,
+    MedicineRecommendationEngine,
+)
+from src.rag.medical_information_answerer import (
+    generate_medical_information_answer,
+)
+from src.rag.medical_information_retriever import retrieve_medical_information
+
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +93,8 @@ def inject_styles():
         .step-title { font-weight: 700; }
         .step-copy { color: var(--muted); font-size: .9rem; margin-top: .15rem; }
         .status-ok { color: var(--teal-dark); font-weight: 700; }
-        .status-warn { color: var(--amber); font-weight: 700; }
+        .status-candidate { color: var(--amber); font-weight: 700; }
+        .status-uncertain { color: #7656a6; font-weight: 700; }
         .status-bad { color: var(--rose); font-weight: 700; }
         .disclaimer { color: var(--muted); font-size: .78rem; border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 2rem; }
         [data-testid="stFileUploaderDropzone"] { background: #ffffff; border: 1px dashed #79aeb0; border-radius: 10px; }
@@ -110,11 +123,96 @@ def prescription_dict(prescription):
     return prescription.model_dump() if hasattr(prescription, "model_dump") else prescription
 
 
+def medical_information_dataset_path():
+    return Path(__file__).resolve().parents[1] / "data" / "final_medlineplus.csv"
+
+
+def normalize_medical_information_name(value):
+    return " ".join((value or "").casefold().split())
+
+
+def _explicit_record_aliases(record):
+    """Return aliases only when the dataset record explicitly supplies them."""
+
+    aliases = record.get("aliases") or ""
+    if isinstance(aliases, str):
+        return [alias for alias in aliases.split("|") if alias.strip()]
+    if isinstance(aliases, (list, tuple)):
+        return [alias for alias in aliases if isinstance(alias, str)]
+    return []
+
+
+def search_medical_information(records, query, limit=10):
+    """Search supplied records without inferring medicine-name equivalence."""
+
+    normalized_query = normalize_medical_information_name(query)
+    if not normalized_query:
+        return {"match_type": "none", "records": [], "total_matches": 0}
+
+    exact_matches = [
+        record
+        for record in records
+        if normalize_medical_information_name(record.get("medicine_name"))
+        == normalized_query
+    ]
+    if exact_matches:
+        return {
+            "match_type": "exact",
+            "records": exact_matches[:limit],
+            "total_matches": len(exact_matches),
+        }
+
+    alias_matches = [
+        record
+        for record in records
+        if normalized_query
+        in {
+            normalize_medical_information_name(alias)
+            for alias in _explicit_record_aliases(record)
+        }
+    ]
+    if alias_matches:
+        return {
+            "match_type": "explicit_alias",
+            "records": alias_matches[:limit],
+            "total_matches": len(alias_matches),
+        }
+
+    fallback_matches = [
+        record
+        for record in records
+        if normalized_query
+        in normalize_medical_information_name(record.get("medicine_name"))
+    ]
+    return {
+        "match_type": "substring" if fallback_matches else "none",
+        "records": fallback_matches[:limit],
+        "total_matches": len(fallback_matches),
+    }
+
+
 @st.cache_data
-def load_medical_information():
-    dataset_path = Path(__file__).resolve().parents[1] / "data" / "final_medlineplus.csv"
+def load_medical_information(dataset_path=None):
+    dataset_path = Path(dataset_path) if dataset_path else medical_information_dataset_path()
     with dataset_path.open("r", encoding="utf-8-sig", newline="") as dataset_file:
         return list(csv.DictReader(dataset_file))
+
+
+def answer_medical_information_question(question, records):
+    """Run the separate retrieval and local-answer stages for a submitted question."""
+
+    retrieval_result = retrieve_medical_information(question, records)
+    return retrieval_result, generate_medical_information_answer(question, retrieval_result)
+
+
+@st.cache_resource
+def get_recommendation_engine():
+    dataset_path = (
+        Path(__file__).resolve().parents[1]
+        / "data"
+        / "cleaned_medical_drug_master.csv"
+    )
+    return MedicineRecommendationEngine(str(dataset_path))
 
 
 def run_analysis(uploaded_file):
@@ -128,16 +226,36 @@ def run_analysis(uploaded_file):
 
         from src.pipeline.prescription_pipeline import process_prescription
 
-        result = None
-        for attempt in range(3):
-            result = process_prescription(temporary_path)
-            if result is not None:
-                break
-
-        return result
+        return process_with_retry(
+            process_prescription,
+            temporary_path,
+        )
     finally:
         if temporary_path:
             Path(temporary_path).unlink(missing_ok=True)
+
+
+def process_with_retry(process_prescription, image_path):
+    """Retry only explicitly transient extraction failures."""
+
+    last_error = None
+
+    for _ in range(3):
+        try:
+            result = process_prescription(image_path)
+        except ExtractionProviderError as error:
+            if not error.retryable:
+                raise
+            last_error = error
+            continue
+
+        if result is not None:
+            return result
+
+    if last_error is not None:
+        raise last_error
+
+    return None
 
 
 def render_header(title, eyebrow, description):
@@ -156,21 +274,25 @@ def render_dashboard(result):
 
     medicine_count = len(result["prescription"].medicines) if result else 0
     verified_count = len(result["verified_medicines"]) if result else 0
-    unverified_count = len(result["unverified_medicines"]) if result else 0
+    review_count = (
+        len(result.get("candidate_medicines", []))
+        + len(result.get("uncertain_medicines", []))
+        + len(result["unverified_medicines"])
+    ) if result else 0
     columns = st.columns(3)
     with columns[0]:
         card_metric("Extracted medicines", medicine_count)
     with columns[1]:
-        card_metric("Verified matches", verified_count)
+        card_metric("Exact matches", verified_count)
     with columns[2]:
-        card_metric("Needs review", unverified_count)
+        card_metric("Needs review", review_count)
 
     st.subheader("How the current pipeline works")
     st.markdown(
         """
         <div class="panel">
           <div class="step"><div class="step-number">1</div><div><div class="step-title">Prescription image</div><div class="step-copy">Select a local image for analysis.</div></div></div>
-          <div class="step"><div class="step-number">2</div><div><div class="step-title">Vision extraction</div><div class="step-copy">The existing Hugging Face VLM returns structured prescription data.</div></div></div>
+          <div class="step"><div class="step-number">2</div><div><div class="step-title">Vision extraction</div><div class="step-copy">Local Ollama runs qwen2.5vl:3b and returns structured prescription data.</div></div></div>
           <div class="step"><div class="step-number">3</div><div><div class="step-title">Medicine verification</div><div class="step-copy">The existing MedicineVerifier checks extracted names against the local dataset.</div></div></div>
           <div class="step"><div class="step-number">4</div><div><div class="step-title">Medical information lookup</div><div class="step-copy">Search the bundled MedlinePlus dataset for uses, precautions, and side effects.</div></div></div>
         </div>
@@ -202,6 +324,9 @@ def render_analysis():
                     else:
                         st.session_state.analysis_result = result
                         st.success("Prescription processed successfully.")
+                except ExtractionProviderError as error:
+                    st.session_state.analysis_result = None
+                    st.error(error.message)
                 except (FileNotFoundError, ValueError):
                     st.error("The image could not be processed. Please choose a valid prescription image.")
                 except Exception as error:
@@ -245,19 +370,28 @@ def render_extracted_prescription(prescription):
 
 
 def render_verification():
-    render_header("Medicine Verification", "Dataset matching", "Review the actual matches returned by MedicineVerifier, including the matching strategy and dataset records.")
+    render_header("Medicine Verification", "Dataset matching", "Review the dataset match status, matching evidence, and any details that need confirmation.")
     result = st.session_state.get("analysis_result")
     if not result:
         st.info("Run a prescription analysis first to view verification results.")
         return
 
-    verified = result["verified_medicines"]
-    unverified = result["unverified_medicines"]
-    if verified:
-        for medicine in verified:
+    groups = [
+        ("Exact Matches", result["verified_medicines"], "status-ok", "Exact Match"),
+        ("Candidate Matches", result.get("candidate_medicines", []), "status-candidate", "Candidate Match"),
+        ("Uncertain Matches", result.get("uncertain_medicines", []), "status-uncertain", "Uncertain"),
+        ("Unmatched Medicines", result["unverified_medicines"], "status-bad", "Unmatched"),
+    ]
+
+    for heading, medicines, status_class, status_label in groups:
+        if not medicines:
+            continue
+
+        st.subheader(heading)
+        for medicine in medicines:
             st.markdown('<div class="panel">', unsafe_allow_html=True)
             st.markdown(f"### {medicine.get('extracted_name') or 'Unnamed medicine'}")
-            columns = st.columns(3)
+            columns = st.columns(4)
             with columns[0]:
                 st.caption("Matched medicine")
                 st.write(medicine.get("verified_name") or "Not available")
@@ -266,20 +400,31 @@ def render_verification():
                 st.write(medicine.get("match_type") or "Not available")
             with columns[2]:
                 st.caption("Status")
-                st.markdown('<span class="status-ok">Verified</span>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<span class="{status_class}">{status_label}</span>',
+                    unsafe_allow_html=True,
+                )
+            with columns[3]:
+                st.caption("Candidates")
+                st.write(medicine.get("candidate_count", 0))
+            details = st.columns(3)
+            with details[0]:
+                st.caption("Strength check")
+                st.write(medicine.get("strength_check") or "Not checked")
+            with details[1]:
+                st.caption("Dosage-form check")
+                st.write(medicine.get("dosage_form_check") or "Not checked")
+            with details[2]:
+                st.caption("Release check")
+                st.write(medicine.get("release_check") or "Not checked")
+            st.caption(medicine.get("message") or medicine.get("reason") or "No explanation returned.")
             records = medicine.get("database_records")
             if records:
-                with st.expander("View matched dataset record"):
+                with st.expander("View matched dataset records"):
                     st.json(records)
             st.markdown('</div>', unsafe_allow_html=True)
 
-    if unverified:
-        st.subheader("Needs review")
-        for medicine in unverified:
-            name = medicine.get("extracted_name") or "Unnamed medicine"
-            reason = medicine.get("reason") or "No match returned."
-            st.warning(f"{name}: {reason}")
-        st.caption("Medicine could not be confidently matched with the available dataset. This does not indicate that it is unsafe.")
+    st.caption("An exact match is an automated dataset match without detected conflicts. Candidate and uncertain results need human review.")
 
 
 def render_medical_information():
@@ -289,50 +434,243 @@ def render_medical_information():
 
     if not search_clicked and not query:
         st.info("Enter a medicine name to search the available medical information dataset.")
-        return
-    if not query.strip():
+    elif not query.strip():
         st.warning("Enter a medicine name before searching.")
+    else:
+        try:
+            lookup = search_medical_information(load_medical_information(), query)
+        except (FileNotFoundError, OSError, UnicodeError, csv.Error):
+            st.error(
+                "Medical information data is unavailable. Check that "
+                "data/final_medlineplus.csv is present and readable."
+            )
+        else:
+            matches = lookup["records"]
+            if not matches:
+                st.warning("No matching medical information was found in the available dataset.")
+            else:
+                if lookup["match_type"] == "exact":
+                    st.success(f"Found {lookup['total_matches']} exact matching record(s).")
+                elif lookup["match_type"] == "explicit_alias":
+                    st.info(
+                        "Found an explicitly supported alias match. Confirm the medicine "
+                        "name before relying on this information."
+                    )
+                else:
+                    st.warning(
+                        "Showing broader name matches only. Confirm the medicine name before "
+                        "relying on this information."
+                    )
+
+                for record in matches:
+                    st.markdown('<div class="panel">', unsafe_allow_html=True)
+                    st.subheader(record.get("medicine_name") or "Unnamed medicine")
+                    columns = st.columns(3)
+                    with columns[0]:
+                        st.markdown("**Uses**")
+                        st.write(record.get("uses") or "Not available")
+                    with columns[1]:
+                        st.markdown("**Precautions**")
+                        st.write(record.get("precautions") or "Not available")
+                    with columns[2]:
+                        st.markdown("**Side effects**")
+                        st.write(record.get("side_effects") or "Not available")
+                    st.caption(f"Source: {record.get('source') or 'Dataset record'}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+                if lookup["total_matches"] > len(matches):
+                    st.caption(
+                        f"Showing the first {len(matches)} of {lookup['total_matches']} matching records."
+                    )
+
+    st.divider()
+    st.subheader("Ask a dataset-grounded question")
+    st.caption(
+        "A local model summarizes only matching MedlinePlus dataset fields. "
+        "It is not medically verified advice."
+    )
+    rag_question = st.text_input(
+        "Question about a medicine",
+        placeholder="For example: What side effects can abacavir cause?",
+        key="rag_medical_information_question_input",
+    )
+    if st.button("Answer from local dataset evidence", key="rag_medical_information_submit"):
+        if not rag_question.strip():
+            st.warning("Enter a medicine-specific question before requesting an answer.")
+        else:
+            try:
+                records = load_medical_information()
+                retrieval_result, answer_result = answer_medical_information_question(
+                    rag_question,
+                    records,
+                )
+                st.session_state.rag_medical_information_submitted_question = rag_question
+                st.session_state.rag_medical_information_retrieval = retrieval_result
+                st.session_state.rag_medical_information_answer = answer_result
+            except (FileNotFoundError, OSError, UnicodeError, csv.Error):
+                st.error(
+                    "Medical information data is unavailable. Check that "
+                    "data/final_medlineplus.csv is present and readable."
+                )
+            except Exception:
+                logger.exception("Medical information question processing failed")
+                st.error("The local medical-information request could not be completed.")
+
+    answer_result = st.session_state.get("rag_medical_information_answer")
+    submitted_question = st.session_state.get(
+        "rag_medical_information_submitted_question"
+    )
+    if not answer_result or not submitted_question:
         return
 
-    normalized_query = " ".join(query.lower().split())
-    matches = [
-        record for record in load_medical_information()
-        if normalized_query in " ".join(record.get("medicine_name", "").lower().split())
+    st.caption(f"Submitted question: {submitted_question}")
+    status = answer_result.get("status")
+    if status == "answered":
+        st.markdown("**Dataset-grounded answer**")
+        st.write(answer_result.get("answer") or "No answer was returned.")
+    elif status in {"ambiguous", "insufficient_evidence"}:
+        st.info(answer_result.get("answer") or "The available dataset cannot answer this question.")
+    else:
+        st.error(answer_result.get("answer") or "Local medical-information generation failed.")
+        if answer_result.get("error"):
+            st.caption(answer_result["error"])
+
+    sources = answer_result.get("sources") or []
+    if sources:
+        st.markdown("**Retrieved sources**")
+        for source in sources:
+            if isinstance(source, dict):
+                st.caption(
+                    f"{source.get('medicine_name') or 'Medicine'} — "
+                    f"{source.get('source') or 'Dataset record'}"
+                )
+
+
+def render_recommendations():
+    render_header(
+        "Medicine Recommendations",
+        "Dataset comparison",
+        "Review possible equivalent product candidates using structured "
+        "dataset attributes. These results are not substitution advice.",
+    )
+    result = st.session_state.get("analysis_result")
+    if not result:
+        st.info("Run a prescription analysis before requesting recommendations.")
+        return
+
+    source_options = []
+    for item in result.get("verified_medicines", []):
+        if item.get("verification_status") != "exact_match":
+            continue
+        records = item.get("database_records") or []
+        if len(records) != 1:
+            continue
+        record = records[0]
+        label = (
+            f"{item.get('extracted_name') or 'Unnamed medicine'} — "
+            f"{record.get('drug_name') or 'Dataset product'}"
+        )
+        source_options.append((label, record))
+
+    if not source_options:
+        st.info(
+            "Recommendations require an exact dataset match with one resolved "
+            "source product. Candidate and uncertain matches are not eligible."
+        )
+        exact_count = sum(
+            item.get("verification_status") == "exact_match"
+            for item in result.get("verified_medicines", [])
+        )
+        st.caption(
+            "Current analysis state: "
+            f"{exact_count} exact match(es), {len(source_options)} resolved "
+            "recommendation source(s). Run the prescription analysis again "
+            "after verification changes to refresh this session's result."
+        )
+        return
+
+    labels = [option[0] for option in source_options]
+    selected_label = st.selectbox("Exact matched source product", labels)
+    selected_record = next(
+        record for label, record in source_options if label == selected_label
+    )
+
+    if st.button("Find possible equivalent products", type="primary"):
+        try:
+            st.session_state.recommendation_result = (
+                get_recommendation_engine().recommend_equivalents(selected_record)
+            )
+            st.session_state.recommendation_source_setid = selected_record.get("SETID")
+        except (FileNotFoundError, ValueError) as error:
+            st.error(f"Recommendation data could not be loaded: {error}")
+            return
+
+    recommendation = st.session_state.get("recommendation_result")
+    if not recommendation:
+        return
+    if st.session_state.get("recommendation_source_setid") != selected_record.get("SETID"):
+        st.info("Select Find possible equivalent products for the selected source.")
+        return
+
+    st.caption(recommendation["message"])
+    if recommendation["recommendation_status"] != "ready":
+        st.warning(recommendation["message"])
+        return
+
+    groups = [
+        (
+            "Same product records",
+            TIER_SAME_PRODUCT,
+            "These records identify the same normalized product.",
+        ),
+        (
+            "Possible equivalent products",
+            TIER_POSSIBLE_EQUIVALENT,
+            "All available ingredient, strength, form, and release checks align.",
+        ),
+        (
+            "Weaker matches requiring review",
+            TIER_WEAKER_MATCH,
+            "These are not substitutes. Review missing information and conflicts.",
+        ),
     ]
-    if not matches:
-        st.warning("No matching medical information was found in the available dataset.")
-        return
-
-    st.success(f"Found {len(matches)} matching record(s).")
-    for record in matches[:10]:
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.subheader(record.get("medicine_name") or "Unnamed medicine")
-        columns = st.columns(3)
-        with columns[0]:
-            st.markdown("**Uses**")
-            st.write(record.get("uses") or "Not available")
-        with columns[1]:
-            st.markdown("**Precautions**")
-            st.write(record.get("precautions") or "Not available")
-        with columns[2]:
-            st.markdown("**Side effects**")
-            st.write(record.get("side_effects") or "Not available")
-        st.caption(f"Source: {record.get('source') or 'Dataset record'}")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    if len(matches) > 10:
-        st.caption(f"Showing the first 10 of {len(matches)} matching records.")
+    for heading, tier, description in groups:
+        candidates = [
+            candidate for candidate in recommendation["candidates"]
+            if candidate["recommendation_tier"] == tier
+        ]
+        if not candidates:
+            continue
+        st.subheader(heading)
+        st.caption(description)
+        for candidate in candidates:
+            record = candidate["record"]
+            st.markdown(
+                f"**{record.get('drug_name') or 'Unnamed dataset product'}**"
+            )
+            if candidate["match_reasons"]:
+                st.write("Matches: " + " ".join(candidate["match_reasons"]))
+            if candidate["missing_attributes"]:
+                st.warning("Missing: " + " ".join(candidate["missing_attributes"]))
+            if candidate["conflicts"]:
+                st.warning("Conflicts: " + " ".join(candidate["conflicts"]))
+            with st.expander("View dataset record"):
+                st.json(record)
 
 
 def main():
     inject_styles()
     if "analysis_result" not in st.session_state:
         st.session_state.analysis_result = None
+    if "recommendation_result" not in st.session_state:
+        st.session_state.recommendation_result = None
+    if "recommendation_source_setid" not in st.session_state:
+        st.session_state.recommendation_source_setid = None
 
     with st.sidebar:
         st.markdown("# MedicaAI")
         st.caption("Prescription intelligence workspace")
-        page = st.radio("Navigate", ["Dashboard", "Prescription Analysis", "Medicine Verification", "Medical Information"], label_visibility="collapsed")
+        page = st.radio("Navigate", ["Dashboard", "Prescription Analysis", "Medicine Verification", "Medicine Recommendations", "Medical Information"], label_visibility="collapsed")
 
     if page == "Dashboard":
         render_dashboard(st.session_state.analysis_result)
@@ -340,6 +678,8 @@ def main():
         render_analysis()
     elif page == "Medicine Verification":
         render_verification()
+    elif page == "Medicine Recommendations":
+        render_recommendations()
     elif page == "Medical Information":
         render_medical_information()
 

@@ -1,0 +1,9 @@
+SETID,drug_name,primary_rxcui,primary_rxstring,ingredient_rxcui,active_moiety_rxcui,available_strength,fda_dosage_form
+source-1,alpha 500 MG / beta 125 MG Oral Tablet,100,alpha 500 MG / beta 125 MG Oral Tablet,1|2,1|2,500 MG / 125 MG,TABLET
+same-product-1,alpha 500 MG / beta 125 MG Oral Tablet,100,alpha 500 MG / beta 125 MG Oral Tablet,1|2,1|2,500 MG / 125 MG,TABLET
+equivalent-1,alpha 500 MG / beta 125 MG Oral Tablet,101,alpha 500 MG / beta 125 MG Oral Tablet,1|2,1|2,500 MG / 125 MG,TABLET
+strength-conflict-1,alpha 875 MG / beta 125 MG Oral Tablet,102,alpha 875 MG / beta 125 MG Oral Tablet,1|2,1|2,875 MG / 125 MG,TABLET
+form-conflict-1,alpha 500 MG / beta 125 MG Oral Suspension,103,alpha 500 MG / beta 125 MG Oral Suspension,1|2,1|2,500 MG / 125 MG,SUSPENSION
+release-conflict-1,12 HR alpha 500 MG / beta 125 MG Extended Release Oral Tablet,104,12 HR alpha 500 MG / beta 125 MG Extended Release Oral Tablet,1|2,1|2,500 MG / 125 MG,"TABLET, EXTENDED RELEASE"
+active-moiety-only-1,gamma 500 MG / delta 125 MG Oral Tablet,105,gamma 500 MG / delta 125 MG Oral Tablet,3|4,1|2,500 MG / 125 MG,TABLET
+missing-strength-1,alpha beta Oral Tablet,106,alpha beta Oral Tablet,1|2,1|2,,TABLET

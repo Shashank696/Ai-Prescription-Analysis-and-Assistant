@@ -1,6 +1,9 @@
 from src.pipeline.prescription_pipeline import (
     process_prescription
 )
+from src.extraction.prescription_extractor import (
+    ExtractionProviderError
+)
 
 
 def main():
@@ -9,9 +12,13 @@ def main():
         "Enter prescription image path: "
     ).strip()
 
-    result = process_prescription(
-        image_path
-    )
+    try:
+        result = process_prescription(
+            image_path
+        )
+    except ExtractionProviderError as error:
+        print(f"\nExtraction failed: {error.message}")
+        return
 
     if result is None:
 
@@ -28,6 +35,16 @@ def main():
     verified = result[
         "verified_medicines"
     ]
+
+    candidates = result.get(
+        "candidate_medicines",
+        [],
+    )
+
+    uncertain = result.get(
+        "uncertain_medicines",
+        [],
+    )
 
     unverified = result[
         "unverified_medicines"
@@ -48,54 +65,33 @@ def main():
             f"{medicine.medicine_name}"
         )
 
-    # ============================================================
-    # VERIFIED
-    # ============================================================
+    verification_groups = [
+        ("EXACT MATCHES", verified),
+        ("CANDIDATE MATCHES", candidates),
+        ("UNCERTAIN MATCHES", uncertain),
+        ("UNMATCHED MEDICINES", unverified),
+    ]
 
-    print("\n" + "=" * 70)
-    print("VERIFIED MEDICINES")
-    print("=" * 70)
+    for heading, medicines in verification_groups:
+        print("\n" + "=" * 70)
+        print(heading)
+        print("=" * 70)
 
-    for medicine in verified:
+        if not medicines:
+            print("None")
+            continue
 
-        print(
-            f"Extracted : "
-            f"{medicine['extracted_name']}"
-        )
-
-        print(
-            f"Verified  : "
-            f"{medicine['verified_name']}"
-        )
-
-        print(
-            f"Match     : "
-            f"{medicine['match_type']}"
-        )
-
-        print("-" * 50)
-
-    # ============================================================
-    # UNVERIFIED
-    # ============================================================
-
-    print("\n" + "=" * 70)
-    print("UNVERIFIED MEDICINES")
-    print("=" * 70)
-
-    if not unverified:
-
-        print("None")
-
-    else:
-
-        for medicine in unverified:
-
-            print(
-                f"{medicine['extracted_name']} "
-                f"-> "
-                f"{medicine['reason']}"
-            )
+        for medicine in medicines:
+            print(f"Extracted : {medicine.get('extracted_name')}")
+            print(f"Matched   : {medicine.get('verified_name') or 'Not available'}")
+            print(f"Status    : {medicine.get('verification_status')}")
+            print(f"Match     : {medicine.get('match_type')}")
+            print(f"Strength  : {medicine.get('strength_check')}")
+            print(f"Form      : {medicine.get('dosage_form_check')}")
+            print(f"Release   : {medicine.get('release_check')}")
+            print(f"Candidates: {medicine.get('candidate_count', 0)}")
+            print(f"Reason    : {medicine.get('message') or medicine.get('reason')}")
+            print("-" * 50)
 
     # ============================================================
     # RAG INPUT
